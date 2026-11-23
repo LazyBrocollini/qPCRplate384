@@ -6,6 +6,10 @@ Run with:  streamlit run app.py
 import pandas as pd
 import streamlit as st
 
+from export_384 import (
+    DEFAULT_DYE, DEFAULT_QUENCHER, DYES, QUENCHERS,
+    load_pp_targets, render_import_txt, validate_import_txt,
+)
 from layouts import LAYOUTS, ROWS_384, COLS_384, layout_by_key, place_on_384, wells_per_sample
 from plate_names import COLS, ROWS, build_records, count_repeats, parse_tables
 
@@ -117,10 +121,10 @@ st.download_button(
 )
 
 # ---------------------------------------------------------------------------
-# Step 2: optional 384-well layout
+# Step 2: 384-well layout and instrument import file
 # ---------------------------------------------------------------------------
 st.divider()
-st.subheader("Step 2: Choose a 384-well layout (optional)")
+st.subheader("Step 2: Build a 384-well import file (optional)")
 
 layout_keys = [NO_LAYOUT] + [layout["key"] for layout in LAYOUTS]
 layout_key = st.selectbox(
@@ -144,19 +148,44 @@ copy_text = ", ".join(
 )
 st.caption(f"Wells per sample in this layout: {copy_text}.")
 
-make_unique_384 = st.checkbox(
-    "Make repeated well names unique (_1, _2, ...)",
-    value=True,
-    help="Triplicate wells that share a sample name get _1, _2, ... after the first one, as in step 1.",
+targets = load_pp_targets()
+st.markdown("**Assay settings** (apply to every plate in this batch)")
+dd1, dd2, dd3 = st.columns(3)
+pp_targets: list[str] = []
+for i, pp_name in enumerate(layout["pp_sets"]):
+    with dd1 if i == 0 else dd2:
+        pp_targets.append(
+            st.selectbox(
+                f"{pp_name} (target)",
+                options=targets,
+                index=min(i, len(targets) - 1),
+                key=f"pp_{layout_key}_{i}",
+                help="Choices come from ppsets.csv. Written to Target Name.",
+            )
+        )
+with dd3:
+    quencher = st.selectbox(
+        "Quencher",
+        options=QUENCHERS,
+        index=QUENCHERS.index(DEFAULT_QUENCHER),
+        key="quencher",
+    )
+dye = st.selectbox(
+    "Dye (Reporter)",
+    options=DYES,
+    index=DYES.index(DEFAULT_DYE),
+    key="dye",
 )
+if len(set(pp_targets)) < len(pp_targets):
+    st.warning("Both PP sets use the same target. Pick different targets.")
 
-placed, missing = place_on_384(records, layout_key, unique_repeats=make_unique_384)
+placed, missing = place_on_384(records, layout_key)
 
 if missing:
-    names_missing = ", ".join(m["sample"] for m in missing[:12])
+    names_missing = ", ".join(sorted({m["sample"] for m in missing})[:12])
     more = f" and {len(missing) - 12} more" if len(missing) > 12 else ""
     st.warning(
-        f"{len(missing)} named sample(s) are not on this layout, so they are not "
+        f"{len(missing)} named well(s) are not on this layout, so they are not "
         f"placed: {names_missing}{more}."
     )
 
@@ -166,14 +195,34 @@ if not placed:
 
 st.metric("Wells filled on 384 plate", len(placed))
 
-st.markdown("**384-well view (names on the plate)**")
+st.markdown("**Instrument import file (one per plate)**")
+for fname, _ in parsed:
+    file_placed = [p for p in placed if p["file"] == fname]
+    if not file_placed:
+        continue
+    wells = {p["well384"]: (p["sample"], pp_targets[p["pp_set"]]) for p in file_placed}
+    txt = render_import_txt(wells, quencher=quencher, dye=dye)
+    problems = validate_import_txt(txt)
+    stem = fname.rsplit(".", 1)[0]
+    if problems:
+        st.error(f"{fname}: export check failed: " + "; ".join(problems))
+    else:
+        st.download_button(
+            f"Download {stem} 384-well import (.txt)",
+            data=txt,
+            file_name=f"{stem}_384_{layout_key}.txt",
+            mime="text/plain",
+            key=f"dl_{fname}_{layout_key}",
+        )
+
+st.markdown("**384-well view (sample names on the plate)**")
 for fname, _ in parsed:
     file_placed = [p for p in placed if p["file"] == fname]
     if not file_placed:
         continue
     grid384 = pd.DataFrame("", index=ROWS_384, columns=[str(c) for c in COLS_384])
     for p in file_placed:
-        grid384.loc[p["well384"][0], p["well384"][1:]] = p["name"]
+        grid384.loc[p["well384"][0], p["well384"][1:]] = p["sample"]
     with st.expander(fname, expanded=len(parsed) == 1):
         st.dataframe(grid384)
 
@@ -184,9 +233,9 @@ long_384 = pd.DataFrame(placed).rename(
         "quadrant": "Quadrant",
         "source": "Source 96 well",
         "sample": "Sample name",
-        "name": "384 name",
     }
 )
+long_384["PP set"] = [pp_targets[p["pp_set"]] for p in placed]
 st.dataframe(long_384, hide_index=True)
 
 st.download_button(
